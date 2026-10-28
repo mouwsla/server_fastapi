@@ -4,6 +4,7 @@ import httpx
 import redis
 
 
+# Адреса сервисов можно переопределить переменными окружения.
 BASE_URL = os.getenv("BASE_URL", "http://app:8000")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
@@ -12,6 +13,7 @@ REQUEST_TIMEOUT = 10.0
 
 
 def test_readiness():
+    # Приложение готово, только когда S3 доступен.
     response = httpx.get(
         f"{BASE_URL}/health/ready",
         timeout=REQUEST_TIMEOUT,
@@ -26,6 +28,7 @@ def test_readiness():
 
 
 def test_invalid_tile_coordinate():
+    # При z=5 координата x=32 уже выходит за диапазон 0..31.
     response = httpx.get(
         f"{BASE_URL}/tiles/5/32/0",
         timeout=REQUEST_TIMEOUT,
@@ -36,6 +39,7 @@ def test_invalid_tile_coordinate():
 
 
 def test_zoom_out_of_range():
+    # В нашем PMTiles нет тайлов ниже минимального масштаба.
     response = httpx.get(
         f"{BASE_URL}/tiles/4/0/0",
         timeout=REQUEST_TIMEOUT,
@@ -48,6 +52,7 @@ def test_zoom_out_of_range():
 def test_tile_cache_miss_then_hit():
     redis_client = redis.Redis.from_url(REDIS_URL)
 
+    # Удаляем только кэш проверяемого тайла.
     matching_keys = list(
         redis_client.scan_iter(
             match="tile:*:7:77:40",
@@ -57,6 +62,7 @@ def test_tile_cache_miss_then_hit():
     if matching_keys:
         redis_client.delete(*matching_keys)
 
+    # Первый запрос должен прочитать тайл из PMTiles.
     first_response = httpx.get(
         f"{BASE_URL}{TILE_PATH}",
         timeout=REQUEST_TIMEOUT,
@@ -67,6 +73,7 @@ def test_tile_cache_miss_then_hit():
     assert first_response.headers["x-cache"] == "MISS"
     assert len(first_response.content) > 0
 
+    # Повторный запрос должен вернуть те же байты из Redis.
     second_response = httpx.get(
         f"{BASE_URL}{TILE_PATH}",
         timeout=REQUEST_TIMEOUT,

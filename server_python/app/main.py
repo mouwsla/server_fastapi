@@ -11,6 +11,7 @@ from pmtiles.tile import Compression, TileType
 import redis
 from redis.exceptions import RedisError
 
+# Настройки подключений передаются контейнеру через переменные окружения.
 S3_ENDPOINT_URL = os.environ["S3_ENDPOINT_URL"]
 S3_ACCESS_KEY = os.environ["S3_ACCESS_KEY"]
 S3_SECRET_KEY = os.environ["S3_SECRET_KEY"]
@@ -18,14 +19,14 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 S3_OBJECT_KEY = os.environ["S3_OBJECT_KEY"]
 REDIS_URL = os.environ["REDIS_URL"]
 
-#Настройки кеширования
-CACHE_MAX_AGE = 60 * 60 * 24 * 7 # 7 days http 
+# Браузер хранит тайл 7 дней, Redis — 24 часа.
+CACHE_MAX_AGE = 60 * 60 * 24 * 7
 REDIS_TILE_TTL_SECONDS = int(
-    os.getenv("REDIS_TILE_TTL_SECONDS", "86400")  # 24 hours redis
+    os.getenv("REDIS_TILE_TTL_SECONDS", "86400")
 )
 
 
-#Словарь MIME-типов
+# MIME-тип ответа зависит от формата тайлов в PMTiles.
 MIME_BY_TILE_TYPE = {
     TileType.MVT: "application/vnd.mapbox-vector-tile",
     TileType.PNG: "image/png",
@@ -47,6 +48,7 @@ def make_s3_source(s3_client):
 
         last_byte = offset + length - 1
 
+        # Range-запрос читает только нужный участок большого PMTiles-файла.
         result = s3_client.get_object(
             Bucket=S3_BUCKET,
             Key=S3_OBJECT_KEY,
@@ -69,7 +71,8 @@ def make_s3_source(s3_client):
 
     return get_bytes
 
-# запуск и завершение приложения
+
+# Создаём общие подключения при запуске и закрываем их при остановке.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s3_client = boto3.client(
@@ -78,7 +81,7 @@ async def lifespan(app: FastAPI):
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
         region_name="us-east-1",
-       config=Config(
+        config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
             connect_timeout=2,
@@ -91,7 +94,8 @@ async def lifespan(app: FastAPI):
             },
         ),
     )
-    # Подключение к Redis
+
+    # Redis хранит готовые байты тайлов без декодирования текста.
     redis_client = redis.Redis.from_url(
         REDIS_URL,
         decode_responses=False,
@@ -100,15 +104,18 @@ async def lifespan(app: FastAPI):
     )
 
     try:
-        # Проверка файла в MinIO
+        # Проверяем доступ к PMTiles и запоминаем версию объекта.
         object_info = s3_client.head_object(
             Bucket=S3_BUCKET,
             Key=S3_OBJECT_KEY,
         )
         object_etag = object_info["ETag"].strip('"')
+
+        # Reader использует S3 Range-запросы для чтения индекса и тайлов.
         reader = Reader(make_s3_source(s3_client))
         header = reader.header()
-        # app.state место для хранения общих объектов приложения 
+
+        # app.state хранит общие объекты между HTTP-запросами.
         app.state.s3 = s3_client
         app.state.pmtiles = reader
         app.state.pmtiles_header = header
@@ -123,17 +130,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# проверка работы HTTP-сервера
+
+# Простая проверка работы HTTP-сервера.
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# сообщает, что процесс Python жив
+
+# Liveness сообщает, что процесс Python жив.
 @app.get("/health/live")
 def health_live():
     return {"status": "alive"}
 
-# сообщает, способен ли процесс Python обслуживать запросы
+
+# Readiness проверяет обязательный S3 и необязательный Redis.
 @app.get("/health/ready")
 def health_ready():
     checks = {
@@ -157,6 +167,7 @@ def health_ready():
             },
         ) from error
 
+    # Без Redis сервис продолжает работать, но без кэширования.
     try:
         app.state.redis.ping()
     except RedisError:
@@ -173,7 +184,8 @@ def health_ready():
         "checks": checks,
     }
 
-# проверка MinIO
+
+# Возвращает состояние PMTiles-объекта в MinIO.
 @app.get("/storage/health")
 def storage_health():
     try:
@@ -200,7 +212,8 @@ def storage_health():
         "max_zoom": header["max_zoom"],
     }
 
-# проверка Redis
+
+# Отдельная проверка соединения с Redis.
 @app.get("/cache/health")
 def cache_health():
     try:
@@ -214,11 +227,12 @@ def cache_health():
     return {"status": "ok"}
 
 
-# получение тайла
+# Возвращает один тайл по координатам XYZ.
 @app.get("/tiles/{z}/{x}/{y}")
 def get_tile(z: int, x: int, y: int):
     header = app.state.pmtiles_header
 
+    # Архив содержит только уровни от min_zoom до max_zoom.
     if not (header["min_zoom"] <= z <= header["max_zoom"]):
         raise HTTPException(
             status_code=404,
@@ -227,6 +241,7 @@ def get_tile(z: int, x: int, y: int):
 
     max_coordinate = (1 << z) - 1
 
+    # На уровне z координаты x и y лежат в диапазоне 0..2^z-1.
     if not (
         0 <= x <= max_coordinate
         and 0 <= y <= max_coordinate
@@ -239,6 +254,7 @@ def get_tile(z: int, x: int, y: int):
     cache_key = make_tile_cache_key(app, z, x, y)
     cache_status = "MISS"
 
+    # Сначала пытаемся вернуть готовый тайл из Redis.
     try:
         cached_tile = app.state.redis.get(cache_key)
     except RedisError:
@@ -252,6 +268,7 @@ def get_tile(z: int, x: int, y: int):
             cache_status="HIT",
         )
 
+    # При промахе PMTiles Reader находит и читает нужный диапазон из S3.
     try:
         tile_data = app.state.pmtiles.get(z, x, y)
     except (BotoCoreError, ClientError) as error:
@@ -266,6 +283,7 @@ def get_tile(z: int, x: int, y: int):
             detail="Tile not found",
         )
 
+    # Если Redis доступен, сохраняем готовый тайл с ограниченным TTL.
     if cache_status != "BYPASS":
         try:
             app.state.redis.set(
@@ -282,19 +300,21 @@ def get_tile(z: int, x: int, y: int):
         cache_status=cache_status,
     )
 
-# генерация ключа кеша
+
+# ETag в ключе отделяет кэш разных версий PMTiles-файла.
 def make_tile_cache_key(
-       app: FastAPI,
-       z: int,
-       x: int,
-       y: int
+    app: FastAPI,
+    z: int,
+    x: int,
+    y: int,
 ) -> str:
     return (
         f"tile:{S3_BUCKET}:{S3_OBJECT_KEY}:"
         f"{app.state.object_etag}:{z}:{x}:{y}"
     )
 
-# создание HTTP-ответа
+
+# Формирует HTTP-ответ с типом тайла и заголовками кэширования.
 def make_tile_response(
     tile_data: bytes,
     header: dict,
@@ -312,6 +332,7 @@ def make_tile_response(
         "X-Cache": cache_status,
     }
 
+    # Сохраняем информацию о сжатии тайла из заголовка PMTiles.
     if header["tile_compression"] == Compression.GZIP:
         response_headers["Content-Encoding"] = "gzip"
 

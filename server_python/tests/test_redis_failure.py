@@ -9,6 +9,7 @@ TILE_PATH = "/tiles/7/77/40"
 REQUEST_TIMEOUT = 10.0
 
 
+# Этот сценарий включается только скриптом проверки отказа Redis.
 pytestmark = pytest.mark.skipif(
     os.getenv("EXPECT_REDIS_DOWN") != "1",
     reason="Redis failure test is disabled",
@@ -16,6 +17,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_app_works_without_redis():
+    # Недоступный Redis переводит readiness в состояние degraded.
     readiness = httpx.get(
         f"{BASE_URL}/health/ready",
         timeout=REQUEST_TIMEOUT,
@@ -29,6 +31,7 @@ def test_app_works_without_redis():
     assert readiness_data["checks"]["s3"] == "ok"
     assert readiness_data["checks"]["redis"] == "degraded"
 
+    # Тайл всё равно читается из PMTiles, минуя кэш.
     tile_response = httpx.get(
         f"{BASE_URL}{TILE_PATH}",
         timeout=REQUEST_TIMEOUT,
