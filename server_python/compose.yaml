@@ -120,7 +120,7 @@ services:
     image: local/caddy:2.11.7-unprivileged
 
     ports:
-      - "127.0.0.1:8080:8080"
+      - "80:8080"
 
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
