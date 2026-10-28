@@ -1,0 +1,19 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /test-runner
+
+COPY requirements-test.txt .
+RUN pip install --no-cache-dir -r requirements-test.txt
+
+RUN groupadd --system --gid 10001 testgroup \
+    && useradd --system --uid 10001 --gid testgroup \
+       --no-create-home --shell /usr/sbin/nologin testuser
+
+COPY --chown=testuser:testgroup tests ./tests
+
+USER testuser
+
+CMD ["pytest", "-v", "-p", "no:cacheprovider", "tests"]

@@ -1,0 +1,229 @@
+services:
+  minio:
+    build:
+      context: .
+      dockerfile: Dockerfile.minio
+      args:
+        MINIO_REF: RELEASE.2025-10-15T17-29-55Z
+
+    image: local/minio:RELEASE.2025-10-15
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test:
+          - CMD
+          - curl
+          - -f
+          - http://localhost:9000/minio/health/live
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+    volumes:
+      - minio_data:/data
+
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.10-alpine
+
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: local/tiles-app:1.0.0
+
+    environment:
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: map
+      S3_OBJECT_KEY: russia_raster_z5_z12.pmtiles
+      REDIS_URL: redis://redis:6379/0
+      REDIS_TILE_TTL_SECONDS: "86400"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+              "http://localhost:8000/health/ready",
+              timeout=3
+          )
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    expose:
+      - "8000"
+
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_started
+        required: false
+
+    restart: unless-stopped
+    
+    init: true
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    pids_limit: 100
+    mem_limit: 512m
+    cpus: "1.0"
+    stop_grace_period: 20s
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+
+    image: local/caddy:2.11.7-unprivileged
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      app:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://localhost:8080/health/live
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    pids_limit: 100
+    mem_limit: 128m
+    cpus: "0.5"
+    stop_grace_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  mc:
+    build:
+      context: .
+      dockerfile: Dockerfile.mc
+      args:
+        MC_REF: RELEASE.2025-08-13T08-35-41Z
+
+    image: local/minio-mc:RELEASE.2025-08-13
+
+    profiles:
+      - tools
+
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+
+    volumes:
+      - ./policies:/policies:ro
+      - ./map:/map:ro
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+
+    profiles:
+      - test
+
+    environment:
+      BASE_URL: http://caddy:8080
+      REDIS_URL: redis://redis:6379/0
+
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      caddy:
+        condition: service_healthy
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+volumes:
+  minio_data:
+  caddy_data:
+  caddy_config:
